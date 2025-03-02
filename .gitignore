@@ -1,0 +1,4 @@
+node_modules
+video_urls.json
+.DS_Store
+.config/
