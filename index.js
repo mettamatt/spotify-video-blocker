@@ -5,7 +5,6 @@
 const puppeteer = require("puppeteer");
 const fs = require("fs").promises;
 const path = require("path");
-const readline = require("readline");
 
 /**************************************************************
  *  Configuration Object
@@ -103,7 +102,6 @@ const detectedDomains = new Set();
  * to avoid duplicate messages
  */
 const loggedThisSession = new Set();
-
 /**
  * A set of “candidate URLs” that pass the request-time check.
  * We'll confirm them in the response-time check.
@@ -261,8 +259,6 @@ const core = {
   /**
    * Load any previously detected video domains from JSON.
    */
-  // Modified the loadExistingDomains function to add known domains by default
-
   async loadExistingDomains() {
     const existingList = await utils.readJsonFile(
       CONFIG.PATHS.VIDEO_DOMAINS,
@@ -300,7 +296,6 @@ const core = {
   async logDomain(domain) {
     if (!domain || domain === "unknown") return;
 
-    // If it's truly new (we've never seen it across all runs):
     if (!detectedDomains.has(domain)) {
       detectedDomains.add(domain);
       console.log(`\nDetected NEW video domain: ${domain}`);
@@ -310,13 +305,9 @@ const core = {
         ...detectedDomains,
       ]);
       this.printDomainStats();
-
-      // If it's an old (known) domain, make sure we haven't logged it yet this session
     } else if (!loggedThisSession.has(domain)) {
       console.log(`\nVideo detected from known domain: ${domain}`);
     }
-
-    // In either case, mark this domain as "logged in this session"
     loggedThisSession.add(domain);
   },
 
@@ -409,11 +400,8 @@ async function setupPageMonitoring(page) {
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
   );
 
-  // Geolocation/permissions
-  await page.setGeolocation({ latitude: 37.773972, longitude: -122.431297 });
   const context = browser.defaultBrowserContext();
   await context.overridePermissions("https://open.spotify.com", [
-    "geolocation",
     "microphone",
     "camera",
     "notifications",
@@ -500,76 +488,10 @@ async function setupPageMonitoring(page) {
     if (utils.isVideoResponse(res)) {
       const domain = utils.getDomain(url);
       await core.logDomain(domain);
-      // (Optional) update UI overlay
-      updateUI();
     }
 
     // Remove from the candidate set so we don't keep it around
     candidateVideoRequests.delete(url);
-  });
-
-  // ---------------------------------------------------------
-  // Optional UI Overlay
-  // ---------------------------------------------------------
-  await page.evaluate(() => {
-    const infoPanel = document.createElement("div");
-    infoPanel.id = "spotify-video-detector";
-    infoPanel.style.cssText = `
-      position: fixed; 
-      top: 10px; 
-      right: 10px; 
-      background: rgba(0, 0, 0, 0.8);
-      color: #1DB954; 
-      padding: 10px; 
-      border-radius: 5px; 
-      z-index: 9999;
-      font-family: Arial, sans-serif; 
-      font-size: 12px; 
-      width: 250px;
-    `;
-    infoPanel.innerHTML = `
-      <div style="text-align: center; font-weight: bold; margin-bottom: 5px;">
-        Spotify Video Detector
-      </div>
-      <div>Status: <span id="detector-status">Active</span></div>
-      <div>Video domains found: <span id="domains-found">0</span></div>
-      <div style="margin-top: 8px; font-size: 11px;">
-        <button id="force-play-btn" style="background: #1DB954; color: white; 
-                border: none; padding: 5px 8px; border-radius: 4px; 
-                cursor: pointer; margin-right: 5px;">
-          Force Play
-        </button>
-      </div>
-    `;
-    document.body.appendChild(infoPanel);
-
-    window.updateDomainCount = (count) => {
-      const domCount = document.getElementById("domains-found");
-      if (domCount) domCount.textContent = count;
-    };
-
-    document.getElementById("force-play-btn").addEventListener("click", () => {
-      const playButtons = Array.from(
-        document.querySelectorAll("button")
-      ).filter((btn) => {
-        const text = btn.textContent.toLowerCase();
-        const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
-        return (
-          text.includes("play") ||
-          aria.includes("play") ||
-          btn.classList.contains("play-button") ||
-          btn.querySelector('svg[data-testid="play-icon"]')
-        );
-      });
-      if (playButtons.length > 0) {
-        console.log(
-          `Found ${playButtons.length} play buttons, clicking first...`
-        );
-        playButtons[0].click();
-      } else {
-        console.log("No play buttons found");
-      }
-    });
   });
 }
 
@@ -577,27 +499,6 @@ async function setupPageMonitoring(page) {
  *  Interactive Commands (Keyboard)
  **************************************************************/
 function setupInputHandlers() {
-  let lastDomainCount = 0;
-
-  // Called whenever we want to refresh the overlay
-  global.updateUI = () => {
-    const currentCount = detectedDomains.size;
-    if (currentCount !== lastDomainCount) {
-      lastDomainCount = currentCount;
-      if (browser && browser.pages) {
-        browser.pages().then((pages) => {
-          if (pages.length > 0) {
-            pages[0]
-              .evaluate((count) => {
-                if (window.updateDomainCount) window.updateDomainCount(count);
-              }, currentCount)
-              .catch(() => {});
-          }
-        });
-      }
-    }
-  };
-
   // Listen for keystrokes
   process.stdin.setRawMode(true);
   process.stdin.resume();
@@ -618,9 +519,6 @@ function setupInputHandlers() {
       console.log("\nExiting...");
       await shutdown();
     }
-
-    // Update UI
-    updateUI();
   });
 }
 
