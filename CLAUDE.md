@@ -2,30 +2,54 @@
 
 ## Build & Run Commands
 
+```bash
+# Install dependencies
+npm install
+
+# Run the application
+npm start  # (alias for node index.js)
 ```
-npm install              # Install dependencies
-npm start                # Run the application (node index.js)
-node index.js            # Start the application manually
-```
 
-## Interactive Commands
+## Interactive Runtime Commands
 
-While the application is running:
-
-- `r` - Generate a report of detected video domains
+- `r` - Generate report of detected video domains
 - `e` - Export domains to CSV
 - `q` - Quit the application
 
 ## Code Style Guidelines
 
-- **Formatting**: Use 2-space indentation for JS files
-- **Naming**: Use camelCase for variables and functions, UPPER_CASE for constants
-- **Comments**: Use block comments with descriptive headers for sections
-- **Error Handling**: Use try/catch with specific error messages
-- **File Structure**: Group related functionality in organized sections
-- **Imports**: List core Node.js modules first, then external dependencies
-- **Utility Functions**: Use a utils object to organize helper functions
-- **Configuration**: Store configuration values in a dedicated CONFIG object
-- **Promises**: Use async/await pattern with proper error handling
-- **Classes/Objects**: Organize related methods within objects (e.g., core)
-- **Types**: Use JSDoc comments for function parameters when needed
+### Structure
+
+- Use descriptive section headers with comment blocks (`//==============`)
+- Group related functionality in logical sections
+- Top-level functions use camelCase
+
+### Formatting
+
+- 2-space indentation
+- Semi-colons required
+- Block-level scoping with braces on same line
+- Max line length ~80 characters
+
+### Naming Conventions
+
+- Constants: UPPER_CASE with underscores
+- Variables/Functions: camelCase
+- Configuration objects: ALL_CAPS properties
+
+### Error Handling
+
+- Use try/catch with specific error messages
+- Wrap event handlers in error-catching functions
+- Provide fallbacks for file operations
+
+### Imports
+
+- Core Node.js modules first, then external dependencies
+- Group imports by source/type
+
+### JS Style
+
+- Use const/let over var
+- Favor async/await over raw Promises
+- Use Set/Map for collections where appropriate

@@ -1,24 +1,26 @@
 /**************************************************************
- *  Spotify Video Domain Detector (Two-Phase Check)
+ *  Spotify Video Domain Detector
+ *  Filename: index.js
  **************************************************************/
 
+//==============================================================
+//  Imports
+//==============================================================
 const puppeteer = require("puppeteer");
 const fs = require("fs").promises;
 const path = require("path");
 
-/**************************************************************
- *  Configuration Object
- **************************************************************/
+//==============================================================
+//  Configuration
+//==============================================================
 const CONFIG = {
-  /**
-   * Known domains or partial matches used in request-time checks.
-   * (Can be more generic: "video-fa.scdn.co", "video.spotifycdn.com", etc.)
-   */
-  KNOWN_SPOTIFY_VIDEO_DOMAINS: [
+  // Existing reference video domains
+  REFERENCE_VIDEO_DOMAINS: [
     "video-fa.scdn.co",
     "video.spotifycdn.com",
     "video.akamaized.net",
     "video-ak.cdn.spotify.com",
+    "video-ak.spotifycdn.com",
     "video-fa.sc",
     "video-akpcw.spotifycdn.com",
     "video-akpcw-cdn-spotify-com.akamaized.net",
@@ -28,20 +30,51 @@ const CONFIG = {
     "video-fa-b.cdn.spotify.com",
   ],
 
-  /**
-   * Path segments that strongly indicate actual video data,
-   * e.g. "/segments/v1/", "/encodings/", "/profiles/" in the URL path.
-   */
-  REQUIRED_VIDEO_PATH_SEGMENTS: ["/segments/v1/", "/encodings/", "/profiles/"],
+  // Reference audio domains that sometimes incorrectly have "video/mp4".
+  REFERENCE_AUDIO_DOMAINS: [
+    "audio-fa.scdn.co",
+    "audio.spotifycdn.com",
+    "audio.akamaized.net",
+    "audio-ak.cdn.spotify.com",
+    "audio-ak.spotifycdn.com",
+    "audio-akpcw.spotifycdn.com",
+    "audio-akpcw-cdn-spotify-com.akamaized.net",
+    "audio-ak.cdn.spotify.com.splitter-eip.akadns.net",
+    "eip-ntt.audio-ak.cdn.spotify.com.akahost.net",
+    "audio-fa.cdn.spotify.com",
+    "audio-fa-b.cdn.spotify.com",
+  ],
 
-  /**
-   * File extensions that typically mean actual video streams: .mp4, .webm, etc.
-   */
-  VIDEO_EXTENSIONS_REGEX: /\.(mp4|webm|m3u8|mpd)(\?|$)/i,
-
-  /**
-   * Accepted video MIME types in the response (Content-Type headers).
-   */
+  IGNORED_DOMAINS: [
+    "api-partner.spotify.com",
+    "api.spotify.com",
+    "accounts.spotify.com",
+    "gue1-spclient.spotify.com",
+    "sentry.io",
+    "cookielaw.org",
+    "google-analytics",
+    "doubleclick.net",
+    "analytics",
+    "tracker",
+    "telemetry",
+    "log.spotify.com",
+  ],
+  DEFINITELY_NON_VIDEO_EXTENSIONS: [
+    ".css",
+    ".js",
+    ".json",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".html",
+    ".map",
+    ".ico",
+  ],
   ACCEPTED_VIDEO_MIME_TYPES: [
     "video/mp4",
     "video/webm",
@@ -53,558 +86,463 @@ const CONFIG = {
   ],
 
   /**
-   * Domains to skip outright (false positives, APIs, etc.).
-   * If a request's domain is in SKIP_DOMAINS, we ignore it.
+   * Optional size-based fallback threshold for "likely video".
+   * Adjust as you see fit or remove this logic if not needed.
    */
-  SKIP_DOMAINS: [
-    "api-partner.spotify.com",
-    "api.spotify.com",
-    "accounts.spotify.com",
-    "gue1-spclient.spotify.com",
-  ],
+  VIDEO_SIZE_THRESHOLD_BYTES: 50 * 1024 * 1024, // 50 MB example
 
-  /**
-   * Common trackers or analytics domains we might abort early.
-   */
-  IGNORE_DOMAINS: [
-    "sentry.io",
-    "cookielaw.org",
-    "google-analytics",
-    "doubleclick.net",
-    "analytics",
-    "tracker",
-    "telemetry",
-    "log.spotify.com",
-  ],
-
-  // File Paths
   PATHS: {
     CONFIG_DIR: path.join(__dirname, ".config"),
-    COOKIES: () => path.join(CONFIG.PATHS.CONFIG_DIR, "spotify-cookies.json"),
-    CREDENTIALS: () => path.join(CONFIG.PATHS.CONFIG_DIR, "credentials.json"),
+    COOKIES: path.join(__dirname, ".config", "spotify-cookies.json"),
     VIDEO_DOMAINS: path.join(__dirname, "video_domains.json"),
     VIDEO_DOMAINS_CSV: path.join(__dirname, "video_domains.csv"),
   },
 };
 
-/**************************************************************
- *  Global Variables
- **************************************************************/
+//==============================================================
+//  Global Variables
+//==============================================================
 let browser;
 let isShuttingDown = false;
-/**
- * A Set of all domains detected so far (that we’ve confirmed
- * are actually hosting video content).
- */
+
+// A set of known or newly discovered video-related domains.
 const detectedDomains = new Set();
-/**
- * Tracks which domains have been logged in the current session
- * to avoid duplicate messages
- */
-const loggedThisSession = new Set();
-/**
- * A set of “candidate URLs” that pass the request-time check.
- * We'll confirm them in the response-time check.
- */
+
+// Known audio domains (excluded from video classification).
+const knownAudioDomains = new Set();
+
+// Requests flagged as potential video (checked in response).
 const candidateVideoRequests = new Set();
 
-/**************************************************************
- *  Utility Functions
- **************************************************************/
+// To avoid re-logging the same known domain multiple times per run.
+const loggedThisSession = new Set();
+
+//===
+// A simple promise chain to avoid race conditions on writes.
+// Each domain write appends to the chain, ensuring no overlap.
+//===
+let domainWriteQueue = Promise.resolve();
+
+//==============================================================
+//  Utility Functions
+//==============================================================
 const utils = {
   /**
-   * Safely read a JSON file; return defaultValue if file is missing/invalid.
+   * Safely read a JSON file, returning a default if not found or invalid.
    */
   async readJsonFile(filePath, defaultValue = []) {
     try {
-      const content = await fs.readFile(filePath, "utf8").catch(() => null);
-      if (!content || !content.trim()) return defaultValue;
-      return JSON.parse(content);
-    } catch (err) {
-      console.error(`Error reading ${filePath}:`, err.message);
+      const content = await fs.readFile(filePath, "utf8");
+      return content ? JSON.parse(content) : defaultValue;
+    } catch {
       return defaultValue;
     }
   },
 
   /**
-   * Write JSON data directly (no backups, no temp rename).
+   * Writes data to a JSON file with pretty formatting.
+   * @note The function is used in a promise chain to avoid concurrency issues.
    */
   async writeJsonFile(filePath, data) {
     try {
       await fs.writeFile(filePath, JSON.stringify(data, null, 2));
-      return true;
     } catch (err) {
-      console.error(`Error writing ${filePath}:`, err.message);
-      return false;
+      console.error(`Error writing to ${filePath}: ${err.message}`);
     }
   },
 
   /**
-   * Request-Time Check: "Is this URL likely to be a Spotify video request?"
-   * 1) Known Spotify video domain,
-   * 2) Must have certain path segments,
-   * 3) Usually a recognized file extension (.mp4, etc.).
-   * 4) Not in skip-list (api domains, etc.).
-   */
-  isLikelyVideoRequest(url) {
-    try {
-      const parsed = new URL(url);
-
-      // 0) Skip known false-positive domains
-      const skipMatch = CONFIG.SKIP_DOMAINS.some((skip) =>
-        parsed.hostname.includes(skip)
-      );
-      if (skipMatch) return false;
-
-      // 1) Must match a known Spotify video domain
-      const domainMatch = CONFIG.KNOWN_SPOTIFY_VIDEO_DOMAINS.some((vd) =>
-        parsed.hostname.includes(vd)
-      );
-      if (!domainMatch) return false;
-
-      // 2) Must have known path segments
-      const lowerPath = parsed.pathname.toLowerCase();
-      const pathHasIndicator = CONFIG.REQUIRED_VIDEO_PATH_SEGMENTS.some((seg) =>
-        lowerPath.includes(seg)
-      );
-      if (!pathHasIndicator) return false;
-
-      // 3) Check for recognized file extension
-      if (!CONFIG.VIDEO_EXTENSIONS_REGEX.test(lowerPath)) {
-        return false;
-      }
-
-      // If all checks pass, it’s “likely” a Spotify video request
-      return true;
-    } catch (err) {
-      // If URL parsing fails or something else, skip
-      return false;
-    }
-  },
-
-  /**
-   * Response-Time Check: "Does the HTTP response truly look like a video?"
-   * We check status code + "content-type" header.
-   */
-  isVideoResponse(response) {
-    const status = response.status();
-    if (status < 200 || status >= 300) {
-      // Consider partial content (206) if you see it in your logs
-      if (status !== 206) return false;
-    }
-
-    const headers = response.headers();
-    const contentType = (headers["content-type"] || "").toLowerCase();
-
-    // Must match at least one known video MIME pattern
-    const mimeMatch = CONFIG.ACCEPTED_VIDEO_MIME_TYPES.some((m) =>
-      contentType.includes(m)
-    );
-    return mimeMatch;
-  },
-
-  /**
-   * Simple domain extractor (returns "unknown" on invalid).
+   * Extract domain from a URL.
    */
   getDomain(url) {
     try {
       return new URL(url).hostname;
-    } catch (err) {
+    } catch {
       return "unknown";
     }
   },
+
+  /**
+   * Checks if a URL points to a known non-video file extension (images, CSS, etc.).
+   */
+  isDefinitelyNotVideoRequest(url) {
+    try {
+      const urlObj = new URL(url);
+      const pathname = urlObj.pathname.toLowerCase();
+      return CONFIG.DEFINITELY_NON_VIDEO_EXTENSIONS.some((ext) =>
+        pathname.endsWith(ext)
+      );
+    } catch {
+      // If parsing fails, we don't assume it's definitely non-video.
+      return false;
+    }
+  },
+
+  /**
+   * Checks if a Puppeteer response likely contains video (based on status + Content-Type).
+   */
+  isVideoResponse(response) {
+    const status = response.status();
+    if (status !== 200 && status !== 206) return false;
+
+    const contentType = (
+      response.headers()["content-type"] || ""
+    ).toLowerCase();
+    return CONFIG.ACCEPTED_VIDEO_MIME_TYPES.some((t) =>
+      contentType.includes(t)
+    );
+  },
 };
 
-/**************************************************************
- *  Core App Logic
- **************************************************************/
-const core = {
-  /**
-   * Create config dir, load existing domain list, launch browser.
-   */
-  async init() {
-    await this.ensureConfigDir();
-    await this.loadExistingDomains();
+//==============================================================
+//  Initialization / Startup
+//==============================================================
+async function init() {
+  try {
+    // Ensure config directory exists
+    await fs.mkdir(CONFIG.PATHS.CONFIG_DIR, { recursive: true });
 
-    console.log("Launching browser...");
-    browser = await puppeteer.launch({
-      headless: false,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
-
-    // Handle unexpected shutdowns
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-    process.on("uncaughtException", async (error) => {
-      console.error("\nUncaught Exception:", error);
-      await shutdown();
-    });
-
-    return browser;
-  },
-
-  /**
-   * Ensure .config folder exists for cookies/credentials.
-   */
-  async ensureConfigDir() {
-    await fs
-      .mkdir(CONFIG.PATHS.CONFIG_DIR, { recursive: true })
-      .catch((err) => {
-        if (err.code !== "EEXIST") {
-          console.error("Error creating config directory:", err);
-        }
-      });
-  },
-
-  /**
-   * Load any previously detected video domains from JSON.
-   */
-  async loadExistingDomains() {
+    // Load existing video domains
     const existingList = await utils.readJsonFile(
       CONFIG.PATHS.VIDEO_DOMAINS,
       []
     );
-    if (Array.isArray(existingList)) {
-      existingList.forEach((d) => detectedDomains.add(d));
-      console.log(
-        `Loaded ${detectedDomains.size} previously detected domains.`
-      );
-    }
+    existingList.forEach((dom) => detectedDomains.add(dom));
 
-    // Add all known Spotify video domains to the detected domains set
-    CONFIG.KNOWN_SPOTIFY_VIDEO_DOMAINS.forEach((domain) => {
-      if (!detectedDomains.has(domain)) {
-        detectedDomains.add(domain);
-        console.log(`Added known domain to detection list: ${domain}`);
-      }
+    // Also add reference video domains
+    CONFIG.REFERENCE_VIDEO_DOMAINS.forEach((dom) => detectedDomains.add(dom));
+
+    // Load reference audio domains into the knownAudioDomains set
+    CONFIG.REFERENCE_AUDIO_DOMAINS.forEach((dom) => knownAudioDomains.add(dom));
+
+    console.log(
+      `Loaded ${detectedDomains.size} known video domains (existing + reference).`
+    );
+
+    // Launch Puppeteer
+    browser = await puppeteer.launch({
+      headless: false, // set to true if you prefer headless mode
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
-    // Save the updated list immediately
-    if (detectedDomains.size > 0) {
-      await utils.writeJsonFile(CONFIG.PATHS.VIDEO_DOMAINS, [
-        ...detectedDomains,
-      ]);
-      console.log(
-        `Saved ${detectedDomains.size} domains to ${CONFIG.PATHS.VIDEO_DOMAINS}`
-      );
-    }
-  },
+    // Graceful shutdown on Ctrl+C
+    process.on("SIGINT", shutdown);
+  } catch (err) {
+    console.error("Error during initialization:", err.message);
+    throw err;
+  }
+}
 
-  /**
-   * If a new domain is found, add to the set & persist.
-   */
-  async logDomain(domain) {
-    if (!domain || domain === "unknown") return;
-
-    if (!detectedDomains.has(domain)) {
-      detectedDomains.add(domain);
-      console.log(`\nDetected NEW video domain: ${domain}`);
-
-      // Persist new domain to file
-      await utils.writeJsonFile(CONFIG.PATHS.VIDEO_DOMAINS, [
-        ...detectedDomains,
-      ]);
-      this.printDomainStats();
-    } else if (!loggedThisSession.has(domain)) {
-      console.log(`\nVideo detected from known domain: ${domain}`);
-    }
-    loggedThisSession.add(domain);
-  },
-
-  /**
-   * Print a simple summary of detected domains so far.
-   */
-  printDomainStats() {
-    console.log(`\nTotal video domains detected: ${detectedDomains.size}`);
-    Array.from(detectedDomains)
-      .sort()
-      .forEach((dom) => console.log(`- ${dom}`));
-  },
-
-  /**
-   * Export domain list to CSV (one domain per line + a header).
-   */
-  async exportDomainsCSV() {
-    if (!detectedDomains.size) {
-      console.log("\nNo video domains detected yet. Nothing to export.");
-      return;
-    }
-    const lines = ["domain", ...Array.from(detectedDomains)];
-    await fs.writeFile(CONFIG.PATHS.VIDEO_DOMAINS_CSV, lines.join("\n"));
-    console.log(
-      `\nExported ${detectedDomains.size} domains to ${CONFIG.PATHS.VIDEO_DOMAINS_CSV}`
-    );
-  },
-
-  /**
-   * Generate a domain-based report in the console.
-   */
-  generateReport() {
-    console.log("\n===== VIDEO DOMAIN REPORT =====");
-    console.log(`Total domains: ${detectedDomains.size}`);
-    if (!detectedDomains.size) {
-      console.log("No domains detected yet.");
-      return;
-    }
-    console.log("Domains:");
-    Array.from(detectedDomains)
-      .sort()
-      .forEach((d) => console.log(`- ${d}`));
-    console.log("================================");
-  },
-
-  /**
-   * Credentials & Cookies (unchanged from your original).
-   */
-  async saveCredentials(email, password) {
-    if (
-      await utils.writeJsonFile(CONFIG.PATHS.CREDENTIALS(), { email, password })
-    ) {
-      console.log("Credentials saved for automatic login");
-      return true;
-    }
-    return false;
-  },
-
-  async loadCredentials() {
-    return await utils.readJsonFile(CONFIG.PATHS.CREDENTIALS(), null);
-  },
-
-  async saveCookies(page) {
-    const cookies = await page.cookies();
-    if (await utils.writeJsonFile(CONFIG.PATHS.COOKIES(), cookies)) {
-      console.log("Session cookies saved for next time");
-      return true;
-    }
-    return false;
-  },
-
-  async loadCookies(page) {
-    const cookies = await utils.readJsonFile(CONFIG.PATHS.COOKIES());
-    if (Array.isArray(cookies) && cookies.length > 0) {
-      await page.setCookie(...cookies);
-      console.log("Previous session cookies loaded");
-      return true;
-    }
-    return false;
-  },
-};
-
-/**************************************************************
- *  Puppeteer Page Monitoring (Two-Phase Logic)
- **************************************************************/
+//==============================================================
+//  Monitoring / Detection
+//==============================================================
 async function setupPageMonitoring(page) {
-  // Basic environment setup
-  await page.setViewport({ width: 1280, height: 800 });
-  await page.setUserAgent(
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-  );
-
-  const context = browser.defaultBrowserContext();
-  await context.overridePermissions("https://open.spotify.com", [
-    "microphone",
-    "camera",
-    "notifications",
-    "background-sync",
-    "midi",
-    "midi-sysex",
-  ]);
-
-  // Handle browser disconnect
-  browser.on("disconnected", () => {
-    console.error("Browser was unexpectedly disconnected");
-    process.exit(1);
-  });
-
-  // Crash
-  page.on("error", async (error) => {
-    console.error("Page crashed:", error);
-    await shutdown();
-  });
-
-  // Filter console errors
-  page.on("console", (message) => {
-    if (message.type() === "error") {
-      const errorText = message.text();
-      const ignored = [
-        "EMEError: No supported keysystem was found",
-        "vendor~web-player",
-        "Failed to load resource: net::ERR_CONNECTION_REFUSED",
-        "Failed to load resource: the server responded with a status of 403",
-        "sentry.io",
-        "cookielaw.org",
-        ".akamaized.",
-        "cdn.",
-        "ingest.sentry",
-        "connect-state",
-        "Failed to load resource",
-      ];
-      const shouldIgnore = ignored.some((p) => errorText.includes(p));
-      if (!shouldIgnore) {
-        console.error("Page error:", errorText);
+  /**
+   * Helper to wrap event handlers and catch any thrown errors.
+   */
+  function wrapEventHandler(handler) {
+    return async (...args) => {
+      try {
+        await handler(...args);
+      } catch (error) {
+        console.error(`Error in event handler: ${error.message}`);
       }
-    }
-  });
+    };
+  }
 
-  // ---------------------------------------------------------
-  // 1) REQUEST INTERCEPTION (isLikelyVideoRequest)
-  // ---------------------------------------------------------
   await page.setRequestInterception(true);
-  let skippedRequests = 0;
 
-  page.on("request", (req) => {
-    const url = req.url();
+  // Attach listeners with error wrapping
+  page.on("request", wrapEventHandler(handleRequest));
+  page.on("response", wrapEventHandler(handleResponse));
 
-    // Abort or skip known tracking/analytics
-    const shouldIgnore = CONFIG.IGNORE_DOMAINS.some((d) => url.includes(d));
-    if (shouldIgnore) {
-      skippedRequests++;
-      if (skippedRequests % 10 === 0) {
-        console.log(`Filtered ${skippedRequests} non-essential requests`);
-      }
-      return req.abort().catch(() => req.continue());
+  //=== NEW: Clean up candidate requests on request failure/timeouts. ===
+  page.on("requestfailed", wrapEventHandler(handleFailedRequest));
+
+  async function handleRequest(req) {
+    const requestUrl = req.url();
+
+    // Skip ignored domains
+    if (CONFIG.IGNORED_DOMAINS.some((d) => requestUrl.includes(d))) {
+      return safelyContinue(req);
     }
 
-    // If the request passes the domain/path checks, store it as "candidate"
-    if (utils.isLikelyVideoRequest(url)) {
-      candidateVideoRequests.add(url);
+    // Skip known non-video resources
+    if (utils.isDefinitelyNotVideoRequest(requestUrl)) {
+      return safelyContinue(req);
     }
 
-    // Continue
-    req.continue().catch(() => {});
-  });
+    // Otherwise, mark as candidate
+    candidateVideoRequests.add(requestUrl);
+    return safelyContinue(req);
+  }
 
-  // ---------------------------------------------------------
-  // 2) RESPONSE CHECK (isVideoResponse)
-  // ---------------------------------------------------------
-  page.on("response", async (res) => {
+  async function handleResponse(res) {
     const url = res.url();
-    // If not previously flagged, skip
-    if (!candidateVideoRequests.has(url)) {
+
+    // Only look at previously flagged requests
+    if (!candidateVideoRequests.has(url)) return;
+
+    const domain = utils.getDomain(url);
+
+    // 1) If domain is in knownAudioDomains, skip
+    if (knownAudioDomains.has(domain)) {
+      candidateVideoRequests.delete(url);
       return;
     }
 
-    // If the response looks like a video, log the domain
+    // 2) If domain is already known video, label it as video
+    if (detectedDomains.has(domain)) {
+      if (!loggedThisSession.has(domain)) {
+        console.log(`Video detected from known domain: ${domain}`);
+      }
+      loggedThisSession.add(domain);
+      candidateVideoRequests.delete(url);
+      return;
+    }
+
+    // 3) If it looks like video but is unknown:
     if (utils.isVideoResponse(res)) {
-      const domain = utils.getDomain(url);
-      await core.logDomain(domain);
+      const contentLength = parseInt(
+        res.headers()["content-length"] || "0",
+        10
+      );
+
+      // If it's above some threshold, assume video; else assume audio
+      if (contentLength > CONFIG.VIDEO_SIZE_THRESHOLD_BYTES) {
+        console.log(
+          `Large content-length (~${contentLength} bytes). Assuming video for domain: ${domain}`
+        );
+        await logDomain(domain);
+      } else {
+        knownAudioDomains.add(domain);
+        console.log(
+          `New domain with "video" MIME but smaller size => Marking as audio: ${domain}`
+        );
+      }
     }
 
-    // Remove from the candidate set so we don't keep it around
     candidateVideoRequests.delete(url);
-  });
+  }
+
+  // NEW: Clean up entries when requests fail or time out
+  async function handleFailedRequest(req) {
+    const requestUrl = req.url();
+    if (candidateVideoRequests.has(requestUrl)) {
+      candidateVideoRequests.delete(requestUrl);
+    }
+  }
+
+  async function safelyContinue(req) {
+    try {
+      await req.continue();
+    } catch (err) {
+      // Request might be already handled/aborted; ignore
+    }
+  }
 }
 
-/**************************************************************
- *  Interactive Commands (Keyboard)
- **************************************************************/
-function setupInputHandlers() {
-  // Listen for keystrokes
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  process.stdin.on("data", async (data) => {
-    const key = data.toString();
+/**
+ * Log a newly discovered domain or a known one.
+ * Uses domainWriteQueue to avoid concurrency issues with file writes.
+ */
+async function logDomain(domain) {
+  if (!detectedDomains.has(domain)) {
+    detectedDomains.add(domain);
+    console.log(`NEW video domain detected: ${domain}`);
 
-    // 'r' => domain-based report
-    if (key === "r") {
-      core.generateReport();
-    }
-    // 'e' => export to CSV
-    else if (key === "e") {
-      console.log("\nExporting domain list to CSV...");
-      await core.exportDomainsCSV();
-    }
-    // 'q' or Ctrl+C => quit
-    else if (key === "q" || key === "\u0003") {
-      console.log("\nExiting...");
-      await shutdown();
-    }
-  });
+    // Append a write to our promise chain
+    domainWriteQueue = domainWriteQueue.then(() =>
+      utils.writeJsonFile(CONFIG.PATHS.VIDEO_DOMAINS, [...detectedDomains])
+    );
+  } else if (!loggedThisSession.has(domain)) {
+    console.log(`Video detected from known domain: ${domain}`);
+  }
+  loggedThisSession.add(domain);
 }
 
-/**************************************************************
- *  Optional Login Handling (if you need to auto-save credentials)
- **************************************************************/
+//==============================================================
+//  Cookie Management
+//==============================================================
+async function saveCookies(page) {
+  try {
+    const cookies = await page.cookies();
+    await utils.writeJsonFile(CONFIG.PATHS.COOKIES, cookies);
+    console.log("Session cookies saved.");
+  } catch (error) {
+    console.error(`Failed to save cookies: ${error.message}`);
+  }
+}
+
+async function loadCookies(page) {
+  const cookies = await utils.readJsonFile(CONFIG.PATHS.COOKIES, []);
+  if (Array.isArray(cookies) && cookies.length > 0) {
+    try {
+      await page.setCookie(...cookies);
+      console.log("Previous session cookies loaded.");
+    } catch (err) {
+      console.error("Error loading cookies:", err.message);
+    }
+  }
+}
+
+//==============================================================
+//  User Login Flow
+//==============================================================
 async function handleLogin(page) {
   await page.goto("https://open.spotify.com", { waitUntil: "networkidle2" });
 
+  // Check if already logged in
   const isLoggedIn = await page.evaluate(() => {
     return !document.querySelector('[data-testid="login-button"]');
   });
 
   if (!isLoggedIn) {
     console.log("Not logged in. Please log in manually.");
+    // Give the user 5 minutes to log in
+    const loginTimeout = setTimeout(() => {
+      console.log(
+        "Login timeout reached. Please restart if you still need to log in."
+      );
+    }, 300000);
 
-    // Poll for login status every 5 seconds
+    // Poll for login every 5 seconds
     const checkLoginInterval = setInterval(async () => {
       const nowLoggedIn = await page.evaluate(() => {
         return !document.querySelector('[data-testid="login-button"]');
       });
       if (nowLoggedIn) {
-        console.log("Login detected!");
+        console.log("Login detected! Saving cookies...");
         clearInterval(checkLoginInterval);
-        await core.saveCookies(page);
+        clearTimeout(loginTimeout);
+        await saveCookies(page);
       }
     }, 5000);
   } else {
-    console.log("Already logged in!");
-    await core.saveCookies(page);
+    console.log("Already logged in! Saving cookies...");
+    await saveCookies(page);
   }
 }
 
-/**************************************************************
- *  Graceful Shutdown
- **************************************************************/
+//==============================================================
+//  User Interaction (Keyboard Commands)
+//==============================================================
+function setupInputHandlers() {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+
+  process.stdin.on("data", (data) => {
+    const key = data.toString().toLowerCase();
+    if (key === "r") {
+      printReport();
+    } else if (key === "e") {
+      exportDomainsCSV().catch((err) =>
+        console.error("Error exporting CSV:", err)
+      );
+    } else if (key === "q" || key === "\u0003") {
+      shutdown().catch((err) => console.error("Error during shutdown:", err));
+    }
+  });
+}
+
+/**
+ * Print a list of all detected video domains
+ */
+function printReport() {
+  console.log("\n===== Detected Video Domains =====");
+  if (!detectedDomains.size) {
+    console.log("No domains detected yet.");
+  } else {
+    Array.from(detectedDomains)
+      .sort()
+      .forEach((dom) => console.log(`- ${dom}`));
+  }
+  console.log("==================================");
+}
+
+/**
+ * Export the detected domains to a CSV file with quoting to handle commas, etc.
+ */
+async function exportDomainsCSV() {
+  if (!detectedDomains.size) {
+    console.log("No video domains detected. Nothing to export.");
+    return;
+  }
+
+  // Properly quote fields
+  const formatCsvField = (field) => `"${field.replace(/"/g, '""')}"`;
+
+  const lines = [formatCsvField("domain")];
+  for (const domain of detectedDomains) {
+    lines.push(formatCsvField(domain));
+  }
+
+  try {
+    await fs.writeFile(CONFIG.PATHS.VIDEO_DOMAINS_CSV, lines.join("\n"));
+    console.log(
+      `Exported ${detectedDomains.size} domains to ${CONFIG.PATHS.VIDEO_DOMAINS_CSV}`
+    );
+  } catch (err) {
+    console.error(`Failed to export CSV: ${err.message}`);
+  }
+}
+
+//==============================================================
+//  Graceful Shutdown
+//==============================================================
 async function shutdown() {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log("\nPerforming clean shutdown...");
-  try {
-    if (browser) {
-      console.log("Closing browser...");
-      const forceExitTimeout = setTimeout(() => {
-        console.error("Browser close timed out, forcing exit...");
-        process.exit(1);
-      }, 5000);
+  console.log("\nShutting down...");
 
-      await browser.close().catch((err) => {
-        console.error("Error closing browser:", err.message);
-      });
-      clearTimeout(forceExitTimeout);
+  //=== 1) Remove STDIN listeners so we don't get stuck ===
+  process.stdin.removeAllListeners("data");
+  process.stdin.setRawMode(false);
+  process.stdin.pause();
+
+  //=== 2) If the browser is open, close all pages then close the browser ===
+  if (browser) {
+    try {
+      const pages = await browser.pages();
+      await Promise.all(pages.map((p) => p.close()));
+      await browser.close();
+    } catch (err) {
+      console.error("Error closing browser:", err.message);
     }
-    console.log("Shutdown complete. Goodbye!");
-    process.exit(0);
-  } catch (err) {
-    console.error("Error during shutdown:", err);
-    process.exit(1);
   }
+
+  //=== 3) Exit the process ===
+  process.exit(0);
 }
 
-/**************************************************************
- *  Main Function
- **************************************************************/
+//==============================================================
+//  Main Entry Point
+//==============================================================
 async function run() {
   try {
-    await core.init();
+    await init();
+    if (!browser) {
+      throw new Error("Browser failed to launch.");
+    }
+
     const page = await browser.newPage();
-
-    // If you want to reuse login sessions
-    await core.loadCookies(page);
-
+    await loadCookies(page);
     await setupPageMonitoring(page);
     setupInputHandlers();
-
-    // Prompt login if needed
     await handleLogin(page);
 
     console.log(
-      "Browser is open. Navigate to Spotify podcasts with video content."
+      "\nBrowser is open. WARNING: Please remain on Spotify while the script runs."
+    );
+    console.log(
+      "Navigate within Spotify (especially podcasts) with potential video content."
     );
     console.log("Interactive commands:");
-    console.log("  r - Generate a report of detected video domains");
+    console.log("  r - Report detected video domains");
     console.log("  e - Export domains to CSV");
     console.log("  q - Quit the application");
+    console.log("----------------------------------");
 
     // Keep the script alive
     await new Promise(() => {});
@@ -614,5 +552,5 @@ async function run() {
   }
 }
 
-// Start
+// Start the application
 run();

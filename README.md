@@ -1,10 +1,10 @@
-# Spotify Video Domain Detector
+# Spotify Video Blocker
 
-A Node.js tool that detects and logs video content domains used by Spotify for podcasts and video content delivery.
+A Node.js tool that detects video content domains used by Spotify for podcasts and video content delivery.
 
 ## Overview
 
-This tool uses Puppeteer to open a browser window and monitor network requests while you browse Spotify. It implements a two-phase detection system to accurately identify and log domains that serve video content on Spotify.
+This tool uses Puppeteer to monitor network requests while you browse Spotify, identifying and logging domains that serve video content. The collected domain list can be used to block unwanted video content, saving bandwidth and improving your Spotify experience.
 
 ### Key Features:
 
@@ -12,7 +12,7 @@ This tool uses Puppeteer to open a browser window and monitor network requests w
 - **Domain Logging**: Automatically saves detected video domains to JSON and CSV files
 - **Session Management**: Saves and reuses login cookies for convenience
 - **Interactive Controls**: Keyboard shortcuts for generating reports and exporting data
-- **Visual Overlay**: Shows status and domain count directly in the browser window
+- **Smart Filtering**: Distinguishes between video and audio content domains
 
 ## Requirements
 
@@ -24,8 +24,8 @@ This tool uses Puppeteer to open a browser window and monitor network requests w
 1. Clone this repository:
 
    ```
-   git clone <repository-url>
-   cd spotify-video-domain-detector
+   git clone https://github.com/mettamatt/spotify-video-blocker.git
+   cd spotify-video-blocker
    ```
 
 2. Install dependencies:
@@ -36,6 +36,12 @@ This tool uses Puppeteer to open a browser window and monitor network requests w
 ## Usage
 
 Start the application:
+
+```
+npm start
+```
+
+or
 
 ```
 node index.js
@@ -51,8 +57,7 @@ node index.js
 
 1. Once logged in, navigate to podcasts or other Spotify content with videos
 2. The tool will automatically detect video domains as you browse
-3. A small overlay panel will appear in the top-right corner showing status and domain count
-4. Use the "Force Play" button in the overlay to attempt autoplay if needed
+3. Detected domains are saved to `video_domains.json` and can be exported to CSV
 
 ### Keyboard Controls
 
@@ -71,24 +76,25 @@ The tool uses a two-phase approach to identify video content:
 1. **Request-Time Check**:
 
    - Matches against known Spotify video domains
-   - Verifies URL path segments (/segments/v1/, /encodings/, etc.)
-   - Checks for video file extensions (.mp4, .webm, etc.)
+   - Checks for video file extensions
+   - Filters out known non-video resources
 
 2. **Response-Time Check**:
    - Validates HTTP status codes
    - Confirms video MIME types in Content-Type headers
+   - Uses content-length thresholds to distinguish between audio and video
 
-### Domain Storage
+### Using the Detected Domains
 
-Detected domains are:
+Once you've collected a list of video domains, you can use them to block video content by:
 
-- Stored in memory during runtime
-- Saved to `video_domains.json` for persistence
-- Exportable to `video_domains.csv` for analysis
+- Adding them to your hosts file
+- Configuring your network-level ad blocker (like Pi-hole)
+- Using them with browser extensions that block specific domains
 
 ## Configuration
 
-The tool comes with a comprehensive configuration object in the code that allows you to:
+The tool includes a comprehensive configuration object in `index.js` that allows you to:
 
 - Add or modify known video domains
 - Adjust path segments used for detection
@@ -100,3 +106,17 @@ The tool comes with a comprehensive configuration object in the code that allows
 - **Browser doesn't open**: Ensure Puppeteer is installed correctly and you have sufficient permissions
 - **No domains detected**: Try navigating to different podcasts or content with video
 - **Login issues**: If automatic login fails, you can log in manually in the opened browser window
+
+## File Structure
+
+```
+/spotify-video-blocker
+├── index.js            # Main application code
+├── package.json        # NPM package configuration
+├── README.md           # This file
+└── video_domains.json  # Detected video domains
+```
+
+## License
+
+[MIT License](LICENSE)
