@@ -199,21 +199,18 @@ const utils = {
 //==============================================================
 async function init() {
   try {
-    // Ensure config directory exists
-    await fs.mkdir(CONFIG.PATHS.CONFIG_DIR, { recursive: true });
+     // Ensure config directory exists
+     await fs.mkdir(CONFIG.PATHS.CONFIG_DIR, { recursive: true });
 
-    // Load existing video domains
-    const existingList = await utils.readJsonFile(
-      CONFIG.PATHS.VIDEO_DOMAINS,
-      []
-    );
-    existingList.forEach((dom) => detectedDomains.add(dom));
+     // Load existing video domains
+     const existingList = await utils.readJsonFile(CONFIG.PATHS.VIDEO_DOMAINS, []);
+     existingList.forEach((dom) => detectedDomains.add(dom));
 
-    // Also add reference video domains
-    CONFIG.REFERENCE_VIDEO_DOMAINS.forEach((dom) => detectedDomains.add(dom));
+     // Also add reference video domains
+     CONFIG.REFERENCE_VIDEO_DOMAINS.forEach((dom) => detectedDomains.add(dom));
 
-    // Load reference audio domains into the knownAudioDomains set
-    CONFIG.REFERENCE_AUDIO_DOMAINS.forEach((dom) => knownAudioDomains.add(dom));
+     // Write the combined set back to the JSON file
+     await utils.writeJsonFile(CONFIG.PATHS.VIDEO_DOMAINS, [...detectedDomains]);
 
     console.log(
       `Loaded ${detectedDomains.size} known video domains (existing + reference).`
